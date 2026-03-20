@@ -1,0 +1,519 @@
+
+/**
+ * Automated User Suspension Script
+ * 
+ * This script automatically suspends Google Workspace users based on their Last Working Day (LWD).
+ * It runs daily at 6 PM IST and processes users from the Off-Boarding sheet.
+ * 
+ * Prerequisites:
+ * - Admin SDK API must be enabled in Google Cloud Console
+ * - Script must be authorized with necessary Google Workspace admin permissions
+ * - Sheet "Off-Boarding" must exist with required columns
+ * 
+ * @author IT Administration Team
+ * @version 2.0
+ * @lastModified 2025-11-26
+ */
+// Configuration Constants for User Suspension Script
+const SUSPENSION_CONFIG = {
+  SHEET_NAME: "Off-Boarding",
+  TIMEZONE: "Asia/Kolkata",
+  DATE_FORMAT: 'dd-MM-yyyy',  // Internal date comparison format
+  SHEET_DATE_FORMAT: 'dd-MM-yyyy',  // Date format used in Column E
+  COLUMNS: {
+    EMAIL: 1,        // Column B (0-based index)
+    LWD: 3,          // Column D
+    STATUS: 4,       // Column E
+    SUSPENSION_DATE: 4  // Column E - will store suspension date in DD-MM-YYYY format
+  },
+  STATUS_TRIGGER: 'suspend',
+  EMAIL_REGEX: /^[^\s@]+@[^\s@]+\.[^\s@]+$/,
+  
+  // Slack Configuration
+  SLACK_WEBHOOK_URL: "https://hooks.slack.com/services/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",
+  SLACK_CHANNEL: "#infra-alerts", // Slack channel for notifications
+  SLACK_ENABLED: true,  // Set to false to disable Slack notifications
+  ADMIN_EMAIL: "mohit.kumar1@zupee.in" // Fallback email for critical errors
+};
+/**
+ * Main function to suspend users at 6 PM IST
+ * Triggered by time-based trigger
+ */
+function suspendUsersAt6PM_IST() {
+  try {
+    Logger.log('=== User Suspension Process Started ===');
+    Logger.log(`Execution Time: ${new Date().toLocaleString('en-IN', { timeZone: CONFIG.TIMEZONE })}`);
+    
+    const sheet = getOffBoardingSheet();
+    if (!sheet) return;
+    
+    const data = sheet.getDataRange().getValues();
+    const todayIST = getTodayDateString();
+    
+    const results = processUserSuspensions(data, todayIST, sheet);
+    logSummary(results);
+    
+    // Send Slack notification with results
+    if (SUSPENSION_CONFIG.SLACK_ENABLED) {
+      sendSlackNotification(results);
+    }
+    
+    Logger.log('=== User Suspension Process Completed ===');
+    
+  } catch (error) {
+    Logger.log(`CRITICAL ERROR: ${error.message}`);
+    Logger.log(`Stack Trace: ${error.stack}`);
+    sendErrorNotification(error);
+  }
+}
+/**
+ * Retrieves the Off-Boarding sheet
+ * @returns {GoogleAppsScript.Spreadsheet.Sheet|null} The sheet object or null if not found
+ */
+function getOffBoardingSheet() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = spreadsheet.getSheetByName(SUSPENSION_CONFIG.SHEET_NAME);
+  
+  if (!sheet) {
+    Logger.log(`ERROR: Sheet "${SUSPENSION_CONFIG.SHEET_NAME}" not found in spreadsheet "${spreadsheet.getName()}"`);
+    return null;
+  }
+  
+  return sheet;
+}
+/**
+ * Gets today's date in IST timezone as formatted string
+ * @returns {string} Date in dd-MM-yyyy format
+ */
+function getTodayDateString() {
+  const now = new Date();
+  return Utilities.formatDate(now, SUSPENSION_CONFIG.TIMEZONE, SUSPENSION_CONFIG.DATE_FORMAT);
+}
+/**
+ * Processes all users and suspends those meeting criteria
+ * @param {Array<Array>} data - Sheet data including headers
+ * @param {string} todayIST - Today's date string
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - The sheet object for updating cells
+ * @returns {Object} Results object with counts and details
+ */
+function processUserSuspensions(data, todayIST, sheet) {
+  const results = {
+    total: 0,
+    suspended: 0,
+    skipped: 0,
+    failed: 0,
+    details: []
+  };
+  
+  // Skip header row (index 0)
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const rowNumber = i + 1; // Actual sheet row number
+    
+    const email = sanitizeEmail(row[SUSPENSION_CONFIG.COLUMNS.EMAIL]);
+    const lwdDateStr = parseLWDDate(row[SUSPENSION_CONFIG.COLUMNS.LWD]);
+    const status = sanitizeStatus(row[SUSPENSION_CONFIG.COLUMNS.STATUS]);
+    
+    // Validate email format
+    if (!isValidEmail(email)) {
+      Logger.log(`Row ${rowNumber}: Invalid or empty email - "${email}"`);
+      results.skipped++;
+      continue;
+    }
+    
+    results.total++;
+    
+    // Check if user should be suspended today
+    if (shouldSuspendUser(lwdDateStr, status, todayIST)) {
+      const suspensionResult = suspendUser(email, rowNumber);
+      
+      if (suspensionResult.success) {
+        results.suspended++;
+        // Update Column E with suspension date in DD-MM-YYYY format
+        updateSuspensionDate(sheet, rowNumber);
+      } else {
+        results.failed++;
+      }
+      
+      results.details.push(suspensionResult);
+    }
+  }
+  
+  return results;
+}
+/**
+ * Sanitizes and trims email address
+ * @param {*} emailValue - Raw email value from sheet
+ * @returns {string} Cleaned email string
+ */
+function sanitizeEmail(emailValue) {
+  return String(emailValue || '').trim();
+}
+/**
+ * Sanitizes and normalizes status value
+ * @param {*} statusValue - Raw status value from sheet
+ * @returns {string} Normalized status string
+ */
+function sanitizeStatus(statusValue) {
+  return String(statusValue || '').trim().toLowerCase();
+}
+/**
+ * Validates email format
+ * @param {string} email - Email address to validate
+ * @returns {boolean} True if valid email format
+ */
+function isValidEmail(email) {
+  return email && SUSPENSION_CONFIG.EMAIL_REGEX.test(email);
+}
+/**
+ * Parses Last Working Day date from various formats
+ * @param {Date|string} lwdValue - Raw LWD value from sheet
+ * @returns {string} Formatted date string or empty string if invalid
+ */
+function parseLWDDate(lwdValue) {
+  if (!lwdValue) return '';
+  
+  // Handle Date objects
+  if (lwdValue instanceof Date && !isNaN(lwdValue.getTime())) {
+    return Utilities.formatDate(lwdValue, SUSPENSION_CONFIG.TIMEZONE, SUSPENSION_CONFIG.DATE_FORMAT);
+  }
+  
+  // Handle string dates
+  if (typeof lwdValue === 'string') {
+    const parsedDate = new Date(lwdValue);
+    if (!isNaN(parsedDate.getTime())) {
+      return Utilities.formatDate(parsedDate, SUSPENSION_CONFIG.TIMEZONE, SUSPENSION_CONFIG.DATE_FORMAT);
+    }
+  }
+  
+  return '';
+}
+/**
+ * Determines if user should be suspended
+ * @param {string} lwdDateStr - User's last working day
+ * @param {string} status - Current status from sheet
+ * @param {string} todayIST - Today's date
+ * @returns {boolean} True if user meets suspension criteria
+ */
+function shouldSuspendUser(lwdDateStr, status, todayIST) {
+  return lwdDateStr === todayIST && status === SUSPENSION_CONFIG.STATUS_TRIGGER;
+}
+/**
+ * Suspends a user in Google Workspace
+ * @param {string} email - User email to suspend
+ * @param {number} rowNumber - Sheet row number for logging
+ * @returns {Object} Result object with success status and details
+ */
+function suspendUser(email, rowNumber) {
+  const result = {
+    email: email,
+    rowNumber: rowNumber,
+    success: false,
+    message: '',
+    timestamp: new Date().toISOString()
+  };
+  
+  try {
+    AdminDirectory.Users.update(
+      { suspended: true },
+      email
+    );
+    
+    result.success = true;
+    result.message = 'User suspended successfully';
+    Logger.log(`✓ Row ${rowNumber}: Successfully suspended ${email}`);
+    
+  } catch (error) {
+    result.success = false;
+    result.message = error.message;
+    Logger.log(`✗ Row ${rowNumber}: Failed to suspend ${email} - ${error.message}`);
+  }
+  
+  return result;
+}
+/**
+ * Updates Column E with suspension date in DD-MM-YYYY format
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - The sheet object
+ * @param {number} rowNumber - Row number to update
+ */
+function updateSuspensionDate(sheet, rowNumber) {
+  try {
+    const today = new Date();
+    const formattedDate = Utilities.formatDate(today, SUSPENSION_CONFIG.TIMEZONE, SUSPENSION_CONFIG.SHEET_DATE_FORMAT);
+    
+    // Column E is index 5 (A=1, B=2, C=3, D=4, E=5)
+    const columnE = SUSPENSION_CONFIG.COLUMNS.SUSPENSION_DATE + 1;
+    sheet.getRange(rowNumber, columnE).setValue(formattedDate);
+    
+    Logger.log(`✓ Row ${rowNumber}: Updated Column E with suspension date: ${formattedDate}`);
+    
+  } catch (error) {
+    Logger.log(`⚠ Row ${rowNumber}: Failed to update suspension date in Column E - ${error.message}`);
+  }
+}
+/**
+ * Logs execution summary
+ * @param {Object} results - Results object from processing
+ */
+function logSummary(results) {
+  Logger.log('\n=== EXECUTION SUMMARY ===');
+  Logger.log(`Total Users Processed: ${results.total}`);
+  Logger.log(`Successfully Suspended: ${results.suspended}`);
+  Logger.log(`Failed: ${results.failed}`);
+  Logger.log(`Skipped (Invalid): ${results.skipped}`);
+  
+  if (results.failed > 0) {
+    Logger.log('\n--- Failed Suspensions ---');
+    results.details
+      .filter(detail => !detail.success)
+      .forEach(detail => {
+        Logger.log(`${detail.email}: ${detail.message}`);
+      });
+  }
+}
+/**
+ * Sends error notification email to IT admin
+ * @param {Error} error - Error object
+ */
+function sendErrorNotification(error) {
+  try {
+    const adminEmail = SUSPENSION_CONFIG.ADMIN_EMAIL;
+    const subject = '[ALERT] User Suspension Script Failed';
+    const body = `
+The automated user suspension script encountered a critical error:
+Error Message: ${error.message}
+Timestamp: ${new Date().toLocaleString('en-IN', { timeZone: SUSPENSION_CONFIG.TIMEZONE })}
+Stack Trace: ${error.stack}
+Please investigate immediately.
+    `;
+    
+    MailApp.sendEmail(adminEmail, subject, body);
+    Logger.log(`Error notification sent to ${adminEmail}`);
+    
+    // Also send error to Slack
+    if (SUSPENSION_CONFIG.SLACK_ENABLED) {
+      sendSlackError(error);
+    }
+    
+  } catch (emailError) {
+    Logger.log(`Failed to send error notification: ${emailError.message}`);
+  }
+}
+/**
+ * Sends suspension results to Slack channel
+ * @param {Object} results - Results object from processing
+ */
+function sendSlackNotification(results) {
+  if (!SUSPENSION_CONFIG.SLACK_WEBHOOK_URL) {
+    Logger.log('⚠️ Slack webhook URL not configured. Skipping Slack notification.');
+    return;
+  }
+  
+  try {
+    const timestamp = new Date().toLocaleString('en-IN', { timeZone: SUSPENSION_CONFIG.TIMEZONE });
+    const statusEmoji = results.failed > 0 ? '⚠️' : '✅';
+    
+    // Build list of suspended users
+    let suspendedUsers = '';
+    if (results.suspended > 0) {
+      suspendedUsers = results.details
+        .filter(detail => detail.success)
+        .map(detail => `• ${detail.email}`)
+        .join('\n');
+    }
+    
+    // Build list of failed suspensions
+    let failedUsers = '';
+    if (results.failed > 0) {
+      failedUsers = '\n\n*Failed Suspensions:*\n' + results.details
+        .filter(detail => !detail.success)
+        .map(detail => `• ${detail.email}: ${detail.message}`)
+        .join('\n');
+    }
+    
+    const message = {
+      "channel": SUSPENSION_CONFIG.SLACK_CHANNEL,
+      "blocks": [
+        {
+          "type": "header",
+          "text": {
+            "type": "plain_text",
+            "text": `${statusEmoji} User Suspension Report`,
+            "emoji": true
+          }
+        },
+        {
+          "type": "section",
+          "fields": [
+            {
+              "type": "mrkdwn",
+              "text": `*Date:*\n${timestamp}`
+            },
+            {
+              "type": "mrkdwn",
+              "text": `*Total Processed:*\n${results.total}`
+            },
+            {
+              "type": "mrkdwn",
+              "text": `*Successfully Suspended:*\n${results.suspended}`
+            },
+            {
+              "type": "mrkdwn",
+              "text": `*Failed:*\n${results.failed}`
+            }
+          ]
+        }
+      ]
+    };
+    
+    // Add suspended users section if any
+    if (suspendedUsers) {
+      message.blocks.push({
+        "type": "section",
+        "text": {
+          "type": "mrkdwn",
+          "text": `*Suspended Users:*\n${suspendedUsers}`
+        }
+      });
+    }
+    
+    // Add failed users section if any
+    if (failedUsers) {
+      message.blocks.push({
+        "type": "section",
+        "text": {
+          "type": "mrkdwn",
+          "text": failedUsers
+        }
+      });
+    }
+    
+    // Add divider and footer
+    message.blocks.push(
+      {
+        "type": "divider"
+      },
+      {
+        "type": "context",
+        "elements": [
+          {
+            "type": "mrkdwn",
+            "text": "🤖 Automated User Suspension System | Off-Boarding Process"
+          }
+        ]
+      }
+    );
+    
+    const options = {
+      'method': 'post',
+      'contentType': 'application/json',
+      'payload': JSON.stringify(message),
+      'muteHttpExceptions': true
+    };
+    
+    const response = UrlFetchApp.fetch(SUSPENSION_CONFIG.SLACK_WEBHOOK_URL, options);
+    
+    if (response.getResponseCode() === 200) {
+      Logger.log('✅ Slack notification sent successfully');
+    } else {
+      Logger.log(`⚠️ Slack notification failed: ${response.getContentText()}`);
+    }
+    
+  } catch (error) {
+    Logger.log(`❌ Failed to send Slack notification: ${error.message}`);
+  }
+}
+/**
+ * Sends error notification to Slack
+ * @param {Error} error - Error object
+ */
+function sendSlackError(error) {
+  if (!SUSPENSION_CONFIG.SLACK_WEBHOOK_URL) {
+    return;
+  }
+  
+  try {
+    const timestamp = new Date().toLocaleString('en-IN', { timeZone: SUSPENSION_CONFIG.TIMEZONE });
+    
+    const message = {
+      "channel": SUSPENSION_CONFIG.SLACK_CHANNEL,
+      "blocks": [
+        {
+          "type": "header",
+          "text": {
+            "type": "plain_text",
+            "text": "🚨 User Suspension Script Error",
+            "emoji": true
+          }
+        },
+        {
+          "type": "section",
+          "text": {
+            "type": "mrkdwn",
+            "text": `*Critical Error Detected*\n\n*Time:* ${timestamp}\n*Error:* ${error.message}`
+          }
+        },
+        {
+          "type": "section",
+          "text": {
+            "type": "mrkdwn",
+            "text": `\`\`\`${error.stack}\`\`\``
+          }
+        },
+        {
+          "type": "context",
+          "elements": [
+            {
+              "type": "mrkdwn",
+              "text": `⚠️ Please investigate immediately | Admin: ${SUSPENSION_CONFIG.ADMIN_EMAIL}`
+            }
+          ]
+        }
+      ]
+    };
+    
+    const options = {
+      'method': 'post',
+      'contentType': 'application/json',
+      'payload': JSON.stringify(message),
+      'muteHttpExceptions': true
+    };
+    
+    UrlFetchApp.fetch(SUSPENSION_CONFIG.SLACK_WEBHOOK_URL, options);
+    Logger.log('Slack error notification sent');
+    
+  } catch (slackError) {
+    Logger.log(`Failed to send Slack error: ${slackError.message}`);
+  }
+}
+/**
+ * Creates a time-based trigger for daily execution at 6 PM IST
+ * Run this function once to set up the automated trigger
+ */
+function setupDailyTrigger() {
+  // Delete existing triggers to avoid duplicates
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(trigger => {
+    if (trigger.getHandlerFunction() === 'suspendUsersAt6PM_IST') {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+  
+  // Create new trigger for 6 PM IST daily
+  ScriptApp.newTrigger('suspendUsersAt6PM_IST')
+    .timeBased()
+    .atHour(18) // 6 PM
+    .everyDays(1)
+    .inTimezone(SUSPENSION_CONFIG.TIMEZONE)
+    .create();
+  
+  Logger.log('✓ Daily trigger created successfully for 6 PM IST');
+}
+/**
+ * Manual test function - processes suspensions for today
+ * Use this to test the script without waiting for the scheduled time
+ */
+function testSuspensionProcess() {
+  Logger.log('=== MANUAL TEST EXECUTION ===');
+  suspendUsersAt6PM_IST();
+}
