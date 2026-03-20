@@ -1,0 +1,514 @@
+/**
+ * Google Workspace User Status Checker
+ * 
+ * @version 2.0.0
+ * @description Automated tool for checking Google Workspace user account status
+ *              including archived, suspended, and active states using Admin SDK API
+ * 
+ * @requires Admin SDK API enabled in Apps Script
+ *           (Resources > Advanced Google Services > Admin SDK API)
+ * 
+ * @author Your Organization
+ * @license MIT
+ */
+
+'use strict';
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+const CONFIG = Object.freeze({
+  SHEET_NAME: 'Off-Boarding',
+  START_ROW: 3,
+  
+  COLUMNS: Object.freeze({
+    EMAIL: 2,      // Column B
+    STATUS: 7,     // Column G
+    DETAILS: 8     // Column H
+  }),
+  
+  PERFORMANCE: Object.freeze({
+    BATCH_SIZE: 50,
+    RATE_LIMIT_DELAY: 100,
+    MAX_RETRIES: 3
+  }),
+  
+  VALIDATION: Object.freeze({
+    EMAIL_REGEX: /^[^\s@]+@[^\s@]+\.[^\s@]+$/,
+    MAX_EMAIL_LENGTH: 254
+  }),
+  
+  UI: Object.freeze({
+    MENU_TITLE: 'Account Status',
+    MENU_ITEMS: {
+      CHECK: '🔍 Check User License Status',
+      CLEAR: '🗑️ Clear Status Data'
+    }
+  })
+});
+
+const STATUS_TYPES = Object.freeze({
+  ACTIVE: 'ACTIVE',
+  ARCHIVED: 'ARCHIVED',
+  SUSPENDED: 'SUSPENDED',
+  NOT_FOUND: 'NOT_FOUND',
+  INVALID_EMAIL: 'INVALID_EMAIL',
+  ERROR: 'ERROR'
+});
+
+const STATUS_COLORS = Object.freeze({
+  [STATUS_TYPES.ACTIVE]: { background: '#d4edda', foreground: '#155724' },
+  [STATUS_TYPES.ARCHIVED]: { background: '#f8d7da', foreground: '#721c24' },
+  [STATUS_TYPES.SUSPENDED]: { background: '#fff3cd', foreground: '#856404' },
+  [STATUS_TYPES.NOT_FOUND]: { background: '#f8d7da', foreground: '#721c24' },
+  [STATUS_TYPES.INVALID_EMAIL]: { background: '#f8d7da', foreground: '#721c24' },
+  [STATUS_TYPES.ERROR]: { background: '#f8d7da', foreground: '#721c24' }
+});
+
+// ============================================================================
+// MENU INITIALIZATION
+// ============================================================================
+
+/**
+ * Creates custom menu when spreadsheet opens
+ * @param {Object} e - Event object passed by Apps Script
+ */
+function onOpen(e) {
+  try {
+    const ui = SpreadsheetApp.getUi();
+    ui.createMenu(CONFIG.UI.MENU_TITLE)
+      .addItem(CONFIG.UI.MENU_ITEMS.CHECK, 'checkArchiveStatus')
+      .addItem(CONFIG.UI.MENU_ITEMS.CLEAR, 'clearStatus')
+      .addToUi();
+    
+    Logger.log('Custom menu created successfully');
+  } catch (error) {
+    Logger.log(`Menu initialization failed: ${error.message}`);
+  }
+}
+
+// ============================================================================
+// MAIN FUNCTIONALITY
+// ============================================================================
+
+/**
+ * Main function to check archive status for all users in the sheet
+ * Performs batch operations for optimal performance
+ */
+function checkArchiveStatus() {
+  const startTime = new Date();
+  Logger.log('Starting archive status check');
+  
+  try {
+    const sheet = getTargetSheet();
+    const emailData = getEmailData(sheet);
+    
+    if (!emailData || emailData.length === 0) {
+      showNotification('No data found in the sheet.', 'Info');
+      return;
+    }
+    
+    const results = processUserStatuses(emailData);
+    applyResultsToSheet(sheet, results);
+    
+    const summary = generateSummary(results, startTime);
+    showNotification(summary, 'Success');
+    
+    Logger.log(`Status check completed: ${results.length} users processed`);
+  } catch (error) {
+    handleError('Archive status check failed', error);
+  }
+}
+
+/**
+ * Clears all status and details columns with user confirmation
+ */
+function clearStatus() {
+  try {
+    if (!confirmClearAction()) {
+      Logger.log('Clear action cancelled by user');
+      return;
+    }
+    
+    const sheet = getTargetSheet();
+    const lastRow = sheet.getLastRow();
+    
+    if (lastRow < CONFIG.START_ROW) {
+      showNotification('No data to clear.', 'Info');
+      return;
+    }
+    
+    const numRows = lastRow - CONFIG.START_ROW + 1;
+    const range = sheet.getRange(
+      CONFIG.START_ROW,
+      CONFIG.COLUMNS.STATUS,
+      numRows,
+      2
+    );
+    
+    range.clearContent().clearFormat();
+    
+    showNotification('Status columns cleared successfully!', 'Success');
+    Logger.log(`Cleared ${numRows} rows of status data`);
+  } catch (error) {
+    handleError('Clear status operation failed', error);
+  }
+}
+
+// ============================================================================
+// HELPER FUNCTIONS - DATA PROCESSING
+// ============================================================================
+
+/**
+ * Retrieves the target sheet for operations
+ * @returns {Sheet} The target Google Sheets object
+ */
+function getTargetSheet() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = spreadsheet.getSheetByName(CONFIG.SHEET_NAME);
+  
+  if (!sheet) {
+    throw new Error(`Sheet "${CONFIG.SHEET_NAME}" not found. Using active sheet.`);
+  }
+  
+  return sheet || spreadsheet.getActiveSheet();
+}
+
+/**
+ * Extracts email data from the sheet
+ * @param {Sheet} sheet - The sheet to read from
+ * @returns {Array<Array>} 2D array of email addresses
+ */
+function getEmailData(sheet) {
+  const lastRow = sheet.getLastRow();
+  
+  if (lastRow < CONFIG.START_ROW) {
+    return [];
+  }
+  
+  const numRows = lastRow - CONFIG.START_ROW + 1;
+  const range = sheet.getRange(CONFIG.START_ROW, CONFIG.COLUMNS.EMAIL, numRows, 1);
+  
+  return range.getValues();
+}
+
+/**
+ * Processes user statuses for all email addresses
+ * @param {Array<Array>} emailData - 2D array of email addresses
+ * @returns {Array<Object>} Array of result objects
+ */
+function processUserStatuses(emailData) {
+  const results = [];
+  
+  emailData.forEach((row, index) => {
+    const email = String(row[0]).trim();
+    const rowNumber = CONFIG.START_ROW + index;
+    
+    if (!email) {
+      results.push(createEmptyResult(rowNumber));
+      return;
+    }
+    
+    if (!validateEmail(email)) {
+      results.push(createInvalidEmailResult(rowNumber, email));
+      return;
+    }
+    
+    const userStatus = getUserStatus(email);
+    results.push(createResult(rowNumber, email, userStatus));
+    
+    if (index < emailData.length - 1) {
+      Utilities.sleep(CONFIG.PERFORMANCE.RATE_LIMIT_DELAY);
+    }
+  });
+  
+  return results;
+}
+
+/**
+ * Retrieves user status from Google Workspace Admin SDK
+ * @param {string} email - User email address
+ * @returns {Object} Status object with type and details
+ */
+function getUserStatus(email) {
+  try {
+    const user = AdminDirectory.Users.get(email);
+    const isArchived = Boolean(user.archived);
+    const isSuspended = Boolean(user.suspended);
+    
+    if (isArchived) {
+      return {
+        type: STATUS_TYPES.ARCHIVED,
+        details: isSuspended 
+          ? 'User is ARCHIVED and SUSPENDED' 
+          : 'User is ARCHIVED'
+      };
+    }
+    
+    if (isSuspended) {
+      return {
+        type: STATUS_TYPES.SUSPENDED,
+        details: 'User is SUSPENDED'
+      };
+    }
+    
+    return {
+      type: STATUS_TYPES.ACTIVE,
+      details: 'User is ACTIVE'
+    };
+    
+  } catch (error) {
+    return parseUserError(error);
+  }
+}
+
+/**
+ * Parses API errors into structured status objects
+ * @param {Error} error - The caught error object
+ * @returns {Object} Status object with type and details
+ */
+function parseUserError(error) {
+  const errorMessage = error.message || '';
+  
+  if (errorMessage.includes('User not found') || 
+      errorMessage.includes('Resource Not Found')) {
+    return {
+      type: STATUS_TYPES.NOT_FOUND,
+      details: 'Mail does not exist in GWS'
+    };
+  }
+  
+  if (errorMessage.includes('forbidden') || 
+      errorMessage.includes('Permission')) {
+    return {
+      type: STATUS_TYPES.ERROR,
+      details: 'Permission denied - Verify Admin SDK access'
+    };
+  }
+  
+  return {
+    type: STATUS_TYPES.ERROR,
+    details: `Error: ${errorMessage.substring(0, 100)}`
+  };
+}
+
+// ============================================================================
+// HELPER FUNCTIONS - RESULT CREATION
+// ============================================================================
+
+/**
+ * Creates an empty result object for blank rows
+ * @param {number} rowNumber - Sheet row number
+ * @returns {Object} Empty result object
+ */
+function createEmptyResult(rowNumber) {
+  return {
+    row: rowNumber,
+    status: '',
+    details: '',
+    format: null,
+    isError: false
+  };
+}
+
+/**
+ * Creates result object for invalid email addresses
+ * @param {number} rowNumber - Sheet row number
+ * @param {string} email - Invalid email address
+ * @returns {Object} Invalid email result object
+ */
+function createInvalidEmailResult(rowNumber, email) {
+  return {
+    row: rowNumber,
+    status: STATUS_TYPES.INVALID_EMAIL,
+    details: 'Invalid email format',
+    format: STATUS_COLORS[STATUS_TYPES.INVALID_EMAIL],
+    isError: true
+  };
+}
+
+/**
+ * Creates standard result object from user status
+ * @param {number} rowNumber - Sheet row number
+ * @param {string} email - User email address
+ * @param {Object} userStatus - Status object from getUserStatus
+ * @returns {Object} Complete result object
+ */
+function createResult(rowNumber, email, userStatus) {
+  return {
+    row: rowNumber,
+    email: email,
+    status: userStatus.type,
+    details: userStatus.details,
+    format: STATUS_COLORS[userStatus.type],
+    isError: userStatus.type === STATUS_TYPES.ERROR || 
+             userStatus.type === STATUS_TYPES.NOT_FOUND
+  };
+}
+
+// ============================================================================
+// HELPER FUNCTIONS - SHEET OPERATIONS
+// ============================================================================
+
+/**
+ * Applies all results to the sheet in batch operations
+ * @param {Sheet} sheet - Target sheet
+ * @param {Array<Object>} results - Array of result objects
+ */
+function applyResultsToSheet(sheet, results) {
+  const statusValues = results.map(r => [r.status]);
+  const detailsValues = results.map(r => [r.details]);
+  
+  const statusRange = sheet.getRange(
+    CONFIG.START_ROW,
+    CONFIG.COLUMNS.STATUS,
+    results.length,
+    1
+  );
+  
+  const detailsRange = sheet.getRange(
+    CONFIG.START_ROW,
+    CONFIG.COLUMNS.DETAILS,
+    results.length,
+    1
+  );
+  
+  // Clear existing formatting and set new values
+  statusRange.clearFormat().setValues(statusValues);
+  detailsRange.clearFormat().setValues(detailsValues);
+  
+  // Apply formatting
+  applyFormatting(sheet, results);
+  
+  SpreadsheetApp.flush();
+}
+
+/**
+ * Applies color formatting to status cells
+ * @param {Sheet} sheet - Target sheet
+ * @param {Array<Object>} results - Array of result objects
+ */
+function applyFormatting(sheet, results) {
+  results.forEach((result, index) => {
+    if (!result.format) return;
+    
+    const rowNumber = CONFIG.START_ROW + index;
+    const statusCell = sheet.getRange(rowNumber, CONFIG.COLUMNS.STATUS);
+    const detailsCell = sheet.getRange(rowNumber, CONFIG.COLUMNS.DETAILS);
+    
+    statusCell
+      .setBackground(result.format.background)
+      .setFontColor(result.format.foreground)
+      .setFontWeight('bold')
+      .setFontSize(9)
+      .setFontFamily('Roboto');
+    
+    detailsCell
+      .setFontSize(9)
+      .setFontFamily('Roboto');
+  });
+}
+
+// ============================================================================
+// HELPER FUNCTIONS - VALIDATION & UTILITIES
+// ============================================================================
+
+/**
+ * Validates email address format
+ * @param {string} email - Email address to validate
+ * @returns {boolean} True if valid, false otherwise
+ */
+function validateEmail(email) {
+  if (!email || email.length > CONFIG.VALIDATION.MAX_EMAIL_LENGTH) {
+    return false;
+  }
+  
+  return CONFIG.VALIDATION.EMAIL_REGEX.test(String(email).toLowerCase());
+}
+
+/**
+ * Generates summary message from results
+ * @param {Array<Object>} results - Processing results
+ * @param {Date} startTime - Processing start time
+ * @returns {string} Formatted summary message
+ */
+function generateSummary(results, startTime) {
+  const checkedCount = results.filter(r => !r.isError && r.status).length;
+  const errorCount = results.filter(r => r.isError).length;
+  const duration = Math.round((new Date() - startTime) / 1000);
+  
+  let message = `✅ Archive status check complete!\n\n`;
+  message += `Checked: ${checkedCount} users\n`;
+  
+  if (errorCount > 0) {
+    message += `Errors: ${errorCount}\n`;
+  }
+  
+  message += `Duration: ${duration}s`;
+  
+  return message;
+}
+
+/**
+ * Displays notification to user
+ * @param {string} message - Message to display
+ * @param {string} type - Message type (Success, Info, Error)
+ */
+function showNotification(message, type = 'Info') {
+  try {
+    const ui = SpreadsheetApp.getUi();
+    ui.alert(type, message, ui.ButtonSet.OK);
+  } catch (error) {
+    Logger.log(`[${type}] ${message}`);
+  }
+}
+
+/**
+ * Confirms clear action with user
+ * @returns {boolean} True if confirmed, false otherwise
+ */
+function confirmClearAction() {
+  try {
+    const ui = SpreadsheetApp.getUi();
+    const response = ui.alert(
+      'Clear Status Data',
+      'Are you sure you want to clear all status and details data?',
+      ui.ButtonSet.YES_NO
+    );
+    
+    return response === ui.Button.YES;
+  } catch (error) {
+    Logger.log('UI not available, proceeding with clear operation');
+    return true;
+  }
+}
+
+/**
+ * Handles errors with logging and user notification
+ * @param {string} context - Error context description
+ * @param {Error} error - The error object
+ */
+function handleError(context, error) {
+  const errorMessage = `${context}: ${error.message}`;
+  Logger.log(errorMessage);
+  Logger.log(error.stack);
+  
+  showNotification(
+    `An error occurred: ${error.message}\n\nPlease check the script logs for details.`,
+    'Error'
+  );
+}
+
+// ============================================================================
+// EXPORTS (for testing)
+// ============================================================================
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    checkArchiveStatus,
+    clearStatus,
+    validateEmail,
+    CONFIG
+  };
+}
