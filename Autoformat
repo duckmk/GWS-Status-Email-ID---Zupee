@@ -1,0 +1,91 @@
+/**
+ * Auto-formats text based on sheet name and column:
+ * 
+ * Sheet: "Off-Boarding"
+ *   - B3:B → Lowercase + Remove ALL whitespace (spaces, enters, tabs)
+ * 
+ * Sheet: "On-Boarding"
+ *   - B2:B → Proper Case
+ *   - C2:C → Lowercase + Remove ALL whitespace
+ *   - D2:D → Proper Case
+ */
+
+function onEdit(e) {
+  if (!e || !e.range) return;
+
+  const sheet = e.source.getActiveSheet();
+  const sheetName = sheet.getName();
+  const range = e.range;
+  const row = range.getRow();
+  const col = range.getColumn();
+  const value = range.getValue();
+
+  // Only process non-empty text
+  if (typeof value !== 'string' || value.trim() === '') return;
+
+  let newValue = value;
+
+  // ====== OFF-BOARDING SHEET ======
+  if (sheetName === "Off-Boarding") {
+    if (row < 3) return;
+
+    if (col === 2) {
+      newValue = cleanAndLowercase(value);
+    } else {
+      return; // Only process column B
+    }
+  }
+
+  // // ====== OFF-BOARDING SHEET ======
+  // if (sheetName === "Off-Boarding") {
+  //   if (row < 3) return;
+
+  //   if (col === 1) {
+  //     newValue = toProperCase(value);
+  //   } else if (col === 2) {
+  //     newValue = cleanAndLowercase(value);
+  //   } else {
+  //     return;
+  //   }
+  // }
+
+  // ====== ON-BOARDING SHEET ======
+  else if (sheetName === "On-Boarding") {
+    if (row < 2) return;
+
+    if (col === 2) {
+      newValue = toProperCase(value);
+    } else if (col === 3) {
+      newValue = cleanAndLowercase(value);
+    } else if (col === 4) {
+      newValue = toProperCase(value);
+    } else {
+      return;
+    }
+  }
+
+  // Update only if changed
+  if (newValue !== value) {
+    range.setValue(newValue);
+  }
+}
+
+// Helper: Proper Case (e.g., "mohit kumar" → "Mohit Kumar")
+function toProperCase(str) {
+  return str
+    .toLowerCase()
+    .split(' ')
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ');
+}
+
+// Helper: Lowercase + Remove ALL whitespace (spaces, tabs, newlines)
+function cleanAndLowercase(str) {
+  return str
+    .toLowerCase()
+    .replace(/\s+/g, ''); // \s+ matches any whitespace (space, tab, newline, etc.)
+}
+
+
+
+
